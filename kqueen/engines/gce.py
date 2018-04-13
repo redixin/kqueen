@@ -118,6 +118,10 @@ class GceEngine(BaseEngine):
                 'initialNodeCount': kwargs.get('node_count', 1),
                 'nodeConfig': {
                     'machineType': kwargs.get('machine_type', 'n1-standard-1')
+                },
+                'networkPolicy': {
+                    'provider': kwargs.get('network_provider', 'CALICO'),
+                    'enabled': kwargs.get('network_policy_enabled', True)
                 }
             }
         }
@@ -170,6 +174,16 @@ class GceEngine(BaseEngine):
         return True, None
 
     def resize(self, node_count, **kwargs):
+
+        if node_count < 2 and \
+           self.cluster_config['cluster']['networkPolicy']['enabled'] is True:
+            msg = 'Resizing cluster {} denied. The minimum size cluster to run \
+                   network policy enforcement is 2 n1-standard-1 instances.\
+                   Otherwise, turn off network policy before resizing.'\
+                   .format(self.cluster_id)
+            logger.error(msg)
+            return False, msg
+
         request = self.client.projects().zones().clusters().nodePools().setSize(
             nodePoolId='default-pool',
             clusterId=self.cluster_id,
@@ -180,11 +194,61 @@ class GceEngine(BaseEngine):
         try:
             request.execute()
         except Exception as e:
-            msg = 'Resizing cluster {} failed with following reason: {}'.format(self.cluster_id, repr(e))
+            msg = 'Resizing cluster {} failed with following reason: {}'\
+                  .format(self.cluster_id, repr(e))
             logger.exception(msg)
             return False, msg
 
         self.cluster.metadata['node_count'] = node_count
+        self.cluster.save()
+
+        return True, None
+
+    def set_network_policy(self, network_provider='CALICO', enabled=False):
+        """ Updating Network policy configuration on cluster
+        Args:
+            network_provider (str): Name of supported network provider.
+            Currently GKE support only Calico driver.
+
+            enabled (bool): Enabled preferred policy, and deploy additional
+            k8s services, related to network managment.
+
+        Returns:
+             (bool): Result of policy-update
+        """
+
+        unsupported_instances = ['g1-small', 'f1-micro']
+        network_policy_body = {
+            'networkPolicy': {
+                'provider': network_provider,
+                'enabled': enabled
+            }
+        }
+
+        m_type = self.cluster['nodeConfig']['machineType']
+        if self.cluster.metadata['node_count'] < 2 or \
+           m_type in unsupported_instances:
+            msg = 'Setting {} Network Policy for the cluster {} denied due to \
+                   unsupported configuration. The recommended minimum size \
+                   cluster to run network policy enforcement is 3 \
+                   n1-standard-1 instances'.format(network_provider,
+                                                   self.cluster_id)
+            logger.error(msg)
+            return False, msg
+
+        try:
+            self.client.projects().zones().clusters().\
+                setNetworkPolicy(projectId=self.project,
+                                 zone=self.zone,
+                                 clusterId=self.cluster_id,
+                                 body=network_policy_body).execute()
+        except Exception as e:
+            msg = 'Setting {} Network Policy for cluster {} failed with \
+                   following reason:'.format(network_provider, self.cluster_id)
+            logger.exception(msg)
+            return False, msg
+
+        self.cluster['networkPolicy'] = network_policy_body['networkPolicy']
         self.cluster.save()
 
         return True, None
